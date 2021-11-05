@@ -35,7 +35,7 @@ declare -r RESOURCE_ID="<your resource id goes here>"
 declare -r NAME="<host name from your A record>"
 
 # Globals
-declare log="<usb path to store log, or /dev/null if you don't want a log>"
+declare log="</mnt/usb/whatever.log, or /dev/null if you don't want a log>"
 declare cron_interval="15"
 
 # ---------------------------------
