@@ -1,0 +1,170 @@
+#!/opt/bin/bash
+
+# ---------------------------------
+# Author
+# ---------------------------------
+#
+# Don Feliciano (don@effinthing.com)
+
+# ---------------------------------
+# Description
+# ---------------------------------
+#
+# Update Linode DNS on an Asus router running Merlin firmware
+
+# ---------------------------------
+# Requirements
+# ---------------------------------
+#
+# 1. Install bash and jq via entware
+# 2. Generate Linode API key, then get Domain ID and Resource ID for your A record
+#    See: https://www.linode.com/docs/products/tools/cloud-manager/guides/cloud-api-keys/
+# 3. Save this script as /jffs/scripts/ddns-start and make sure it's executable
+#    Run dos2unix on it if you edited it using Winblows
+# 4. Test it from command line, and once you're happy change DDNS to "Custom"
+
+# ---------------------------------
+# Variables - you must change these
+# ---------------------------------
+#
+# Constants
+declare -r SCRIPT_NAME="$(basename ${BASH_SOURCE[0]})"
+declare -r LINODE_API_KEY="<your key goes here>"
+declare -r DOMAIN_ID="<your domain id goes here>"
+declare -r RESOURCE_ID="<your resource id goes here>"
+declare -r NAME="<host name from your A record>"
+
+# Globals
+declare log="<usb path to store log, or /dev/null if you don't want a log>"
+declare cron_interval="15"
+
+# ---------------------------------
+# Functions
+# ---------------------------------
+#
+log_msg() {
+    local msg="${1}"
+    local detail="${2}"
+
+    # Log to both syslog and ${log}
+    if [[ ${detail:=false} == true ]]; then
+        printf "\n${msg}\n\n" >> ${log}
+    else
+        logger -t ${SCRIPT_NAME} "${msg}"
+        printf "$(date '+%b %d %H:%M:%S'):\t${msg}\n" >> ${log}
+    fi
+
+    return 0;
+
+}
+
+purge_log() {
+	local log_size="$(du -k ${log} | awk '{ print $1 }')"
+	if (( log_size > 1024 )); then
+		: > ${log}
+		log_msg "Purged ${log}"
+	fi
+}
+
+check_cron() {
+    # Run this script every ${cron_interval} minutes
+    if [[ -z $(cru l | grep ${SCRIPT_NAME}) ]]; then
+        # Add cron job
+        cru a ${SCRIPT_NAME} "*/${cron_interval} * * * * /jffs/scripts/ddns-start \$(nvram get wan_ipaddr)"
+        log_msg "Added cron job"
+    fi
+
+    return 0
+}
+
+notify_firmware() {
+    # The router firmware calls /jffs/scripts/ddns-start when you tell
+    # it to use "custom" as the DDNS provider. It also expects to be told
+    # whether the DDNS provider errored out or succeeded
+    # 0=fail, 1=pass
+    /sbin/ddns_custom_updated ${1}
+
+    return 0
+}
+
+update_dns_record () {
+    # Use curl to PUT new IP in A record for ${NAME}
+    local new_ip="${1}"
+    local json_response=$(
+        curl -s -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${LINODE_API_KEY}" \
+            -X PUT -d '{
+                "type": "A",
+                "name": "'${NAME}'",
+                "target": "'${new_ip}'",
+                "priority": 0,
+                "weight": 0,
+                "port": 0,
+                "service": null,
+                "protocol": null,
+                "ttl_sec": 30,
+                "tag": null
+            }' \
+            https://api.linode.com/v4/domains/${DOMAIN_ID}/records/${RESOURCE_ID} 2>/dev/null
+        )
+        local json_ip=$(echo ${json_response} | jq --raw-output '.target')
+
+        if [[ ${json_ip} == ${new_ip} ]]; then
+            # IP changed
+            log_msg "Succeeded updating DNS A record for ${NAME} with target: ${new_ip}"
+            notify_firmware 1
+            return 0
+        else
+            # IP change failed
+            log_msg "Failed updating DNS A record for ${NAME}"
+            log_msg "${json_response}" true
+            notify_firmware 0
+            return 1
+        fi
+}
+
+main() {
+    # Purge log file when it hits 1G in like 500 years
+    purge_log
+
+    # Make sure cron job exists
+    check_cron
+
+    # Router firmware will pass us current WAN IP - $(nvram get wan_ipaddr)
+    local current_ip=${1}
+
+    # See what IP Linode has, already. I thought about just doing $(dig +short <hostname>),
+    # but with DNS caching enabled on the router that's not so reliable. Also, we don't want
+    # to push an update if that's already done and we're just waiting out TTL
+    local dns_ip=$(curl -s -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${LINODE_API_KEY}" \
+                -X GET https://api.linode.com/v4/domains/${DOMAIN_ID}/records/${RESOURCE_ID} 2>/dev/null | \
+                jq --raw-output '.target')
+
+    # Bail if IP wasn't passed or we couldn't pull A record via Linode API
+    if [[ ! ${current_ip} =~ ^[0-9] ]] || [[ ! ${dns_ip} =~ ^[0-9] ]]; then
+        log_msg "IP address lookup failed"
+        log_msg "\$current_ip=${current_ip:=null} \$dns_ip=${dns_ip:=null}"
+        notify_firmware 0
+        return 1
+    fi
+
+    if [[ ${current_ip} != ${dns_ip} ]]; then
+        # IPs do not match, so we need to update DNS
+        update_dns_record ${current_ip}
+        return ${?}
+    else
+        # IP change not needed, but we have to report that to the firmware to keep it happy
+        #log_msg "IP address is still ${current_ip}"
+        notify_firmware 1
+        return 0
+    fi
+}
+
+# ---------------------------------
+# Main script
+# ---------------------------------
+#
+main "${@}"
+
+exit ${?}
