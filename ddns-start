@@ -87,6 +87,18 @@ notify_firmware() {
     return 0
 }
 
+get_dns_ip() {
+    # See what IP Linode has, already. I thought about just doing $(dig +short <hostname>),
+    # but with DNS caching enabled on the router that's not so reliable. Also, we don't want
+    # to push an update if that's already done and we're just waiting out TTL
+    local dns_ip=$(curl -s -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${LINODE_API_KEY}" \
+                -X GET https://api.linode.com/v4/domains/${DOMAIN_ID}/records/${RESOURCE_ID} 2>/dev/null | \
+                jq --raw-output '.target')
+
+    [[ ${dns_ip} =~ ^[0-9] ]] && echo ${dns_ip}
+}
+
 update_dns_record () {
     # Use curl to PUT new IP in A record for ${NAME}
     local new_ip="${1}"
@@ -130,21 +142,17 @@ main() {
     # Make sure cron job exists
     check_cron
 
-    # Router firmware will pass us current WAN IP - $(nvram get wan_ipaddr)
+    # Router firmware will pass us current WAN IP $(nvram get wan_ipaddr)
     local current_ip=${1}
+    if [[ ! ${current_ip} =~ ^[0-9] ]]; then
+        log_msg "Router firmware did not pass current IP"
+        notify_firmware 0
+        return 1
+    fi
 
-    # See what IP Linode has, already. I thought about just doing $(dig +short <hostname>),
-    # but with DNS caching enabled on the router that's not so reliable. Also, we don't want
-    # to push an update if that's already done and we're just waiting out TTL
-    local dns_ip=$(curl -s -H "Content-Type: application/json" \
-                -H "Authorization: Bearer ${LINODE_API_KEY}" \
-                -X GET https://api.linode.com/v4/domains/${DOMAIN_ID}/records/${RESOURCE_ID} 2>/dev/null | \
-                jq --raw-output '.target')
-
-    # Bail if IP wasn't passed or we couldn't pull A record via Linode API
-    if [[ ! ${current_ip} =~ ^[0-9] ]] || [[ ! ${dns_ip} =~ ^[0-9] ]]; then
-        log_msg "IP address lookup failed"
-        log_msg "\$current_ip=${current_ip:=null} \$dns_ip=${dns_ip:=null}"
+    local dns_ip=$(get_dns_ip)
+    if [[ ! ${dns_ip:-null} =~ ^[0-9] ]]; then
+        log_msg "Fetching IP from Linode DNS record failed"
         notify_firmware 0
         return 1
     fi
