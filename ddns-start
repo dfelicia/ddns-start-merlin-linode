@@ -1,32 +1,7 @@
 #!/opt/bin/bash
 
-# ---------------------------------
-# Author
-# ---------------------------------
-#
-# Don Feliciano (don@effinthing.com)
+# Update Linode DNS for beaver.effinthing.com
 
-# ---------------------------------
-# Description
-# ---------------------------------
-#
-# Update Linode DNS on an Asus router running Merlin firmware
-
-# ---------------------------------
-# Requirements
-# ---------------------------------
-#
-# 1. Install bash and jq via entware
-# 2. Generate Linode API key, then get Domain ID and Resource ID for your A record
-#    See: https://www.linode.com/docs/products/tools/cloud-manager/guides/cloud-api-keys/
-# 3. Save this script as /jffs/scripts/ddns-start and make sure it's executable
-#    Run dos2unix on it if you edited it using Winblows
-# 4. Test it from command line, and once you're happy change DDNS to "Custom"
-
-# ---------------------------------
-# Variables - you must change these
-# ---------------------------------
-#
 # Constants
 declare -r SCRIPT_NAME="$(basename ${BASH_SOURCE[0]})"
 declare -r LINODE_API_KEY="<your key goes here>"
@@ -35,13 +10,9 @@ declare -r RESOURCE_ID="<your resource id goes here>"
 declare -r NAME="<host name from your A record>"
 
 # Globals
-declare log="</mnt/usb/whatever.log, or /dev/null if you don't want a log>"
-declare cron_interval="15"
+declare log="/opt/var/log/ddns-start.log"
 
-# ---------------------------------
 # Functions
-# ---------------------------------
-#
 log_msg() {
     local msg="${1}"
     local detail="${2}"
@@ -67,10 +38,10 @@ purge_log() {
 }
 
 check_cron() {
-    # Run this script every ${cron_interval} minutes
+    # Frontier changes our IP very often, so we want to run this script every 15 minutes
     if [[ -z $(cru l | grep ${SCRIPT_NAME}) ]]; then
         # Add cron job
-        cru a ${SCRIPT_NAME} "*/${cron_interval} * * * * /jffs/scripts/ddns-start \$(nvram get wan_ipaddr)"
+        cru a ${SCRIPT_NAME} "*/15 * * * * /jffs/scripts/ddns-start \$(nvram get wan_ipaddr)"
         log_msg "Added cron job"
     fi
 
@@ -87,6 +58,36 @@ notify_firmware() {
     return 0
 }
 
+reconcile_wan_ip() {
+    local nvram_ip=${1}
+    local ipinfo_ip=$(curl -s ipinfo.io/ip 2>/dev/null)
+
+    if [[ ! ${nvram_ip} =~ ^[0-9] ]]; then
+        log_msg "Router firmware did not pass a valid IP"
+        nvram_ip=$(nvram get wan_ipaddr)
+        log_msg "NVRAM says IP is ${nvram_ip}"
+    fi
+
+    if [[ ${nvram_ip} == ${ipinfo_ip} ]]; then
+        echo ${nvram_ip}
+    else
+        log_msg "NVRAM WAN value (${nvram_ip}) does not match ipinfo.io/ip (${ipinfo_ip:=null})"
+        # Assume that if we can ping ${ipinfo_ip} that it is correct
+        # I have seen the NVRAM value take a min to get the right value
+        ping -c1 ${ipinfo_ip} | grep -qs '1 packets received'
+        if (( ${?} == 0 )); then
+            log_msg "${ipinfo_ip} is alive - overriding NVRAM value"
+            echo ${ipinfo_ip}
+	    nvram set wan_ipaddr=${ipinfo_ip}
+        else
+            log_msg "${ipinfo_ip} is unreachable - retaining NVRAM value"
+            echo ${nvram_ip}
+        fi
+    fi
+
+    return 0
+}
+
 get_dns_ip() {
     # See what IP Linode has, already. I thought about just doing $(dig +short <hostname>),
     # but with DNS caching enabled on the router that's not so reliable. Also, we don't want
@@ -96,7 +97,13 @@ get_dns_ip() {
                 -X GET https://api.linode.com/v4/domains/${DOMAIN_ID}/records/${RESOURCE_ID} 2>/dev/null | \
                 jq --raw-output '.target')
 
-    [[ ${dns_ip} =~ ^[0-9] ]] && echo ${dns_ip}
+    if [[ ${dns_ip} =~ ^[0-9] ]]; then
+        echo ${dns_ip}
+    else
+        log_msg "api.linode.com returned ${dns_ip}"
+    fi
+
+    return 0
 }
 
 update_dns_record () {
@@ -119,23 +126,27 @@ update_dns_record () {
             }' \
             https://api.linode.com/v4/domains/${DOMAIN_ID}/records/${RESOURCE_ID} 2>/dev/null
         )
-        local json_ip=$(echo ${json_response} | jq --raw-output '.target')
+    local json_ip=$(echo ${json_response} | jq --raw-output '.target')
 
-        if [[ ${json_ip} == ${new_ip} ]]; then
-            # IP changed
-            log_msg "Succeeded updating DNS A record for ${NAME} with target: ${new_ip}"
-            notify_firmware 1
-            return 0
-        else
-            # IP change failed
-            log_msg "Failed updating DNS A record for ${NAME}"
-            log_msg "${json_response}" true
-            notify_firmware 0
-            return 1
-        fi
+    if [[ ${json_ip} == ${new_ip} ]]; then
+        # IP changed
+        log_msg "Succeeded updating DNS A record for ${NAME} with ${new_ip}"
+        notify_firmware 1
+        return 0
+    else
+        # IP change failed
+        log_msg "Failed updating DNS A record for ${NAME}"
+        log_msg "${json_response}" true
+        notify_firmware 0
+        return 1
+    fi
+
+    return 0
 }
 
 main() {
+    umask 0077
+
     # Purge log file when it hits 1G in like 500 years
     purge_log
 
@@ -143,13 +154,10 @@ main() {
     check_cron
 
     # Router firmware will pass us current WAN IP $(nvram get wan_ipaddr)
-    local current_ip=${1}
-    if [[ ! ${current_ip} =~ ^[0-9] ]]; then
-        log_msg "Router firmware did not pass current IP"
-        notify_firmware 0
-        return 1
-    fi
+    # Reconcile that with what the internet says our IP is
+    local current_ip=$(reconcile_wan_ip ${1})
 
+    # Fetch current A record value
     local dns_ip=$(get_dns_ip)
     if [[ ! ${dns_ip:-null} =~ ^[0-9] ]]; then
         log_msg "Fetching IP from Linode DNS record failed"
@@ -157,22 +165,22 @@ main() {
         return 1
     fi
 
+    # Update A record if IP has changed
     if [[ ${current_ip} != ${dns_ip} ]]; then
         # IPs do not match, so we need to update DNS
+        log_msg "Change detected! WAN IP is now ${current_ip}"
         update_dns_record ${current_ip}
         return ${?}
     else
         # IP change not needed, but we have to report that to the firmware to keep it happy
         #log_msg "IP address is still ${current_ip}"
+        #log_msg "WAN IP ${current_ip} has not changed"
         notify_firmware 1
         return 0
     fi
 }
 
-# ---------------------------------
 # Main script
-# ---------------------------------
-#
 main "${@}"
 
 exit ${?}
