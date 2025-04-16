@@ -1,6 +1,6 @@
 #!/opt/bin/bash
 
-# Update Linode DNS for beaver.effinthing.com
+# Update Linode DNS
 
 # Constants
 declare -r SCRIPT_NAME="$(basename ${BASH_SOURCE[0]})"
@@ -41,7 +41,7 @@ check_cron() {
     # Frontier changes our IP very often, so we want to run this script every 15 minutes
     if [[ -z $(cru l | grep ${SCRIPT_NAME}) ]]; then
         # Add cron job
-        cru a ${SCRIPT_NAME} "*/15 * * * * /jffs/scripts/ddns-start \$(nvram get wan_ipaddr)"
+        cru a ${SCRIPT_NAME} "*/15 * * * * /jffs/scripts/ddns-start \$(nvram get wan0_realip_ip)"
         log_msg "Added cron job"
     fi
 
@@ -60,29 +60,48 @@ notify_firmware() {
 
 reconcile_wan_ip() {
     local nvram_ip=${1}
-    local ipinfo_ip=$(curl -s ipinfo.io/ip 2>/dev/null)
+    local ipinfo_ip
+    local tries
 
-    if [[ ! ${nvram_ip} =~ ^[0-9] ]]; then
-        log_msg "Router firmware did not pass a valid IP"
-        nvram_ip=$(nvram get wan_ipaddr)
-        log_msg "NVRAM says IP is ${nvram_ip}"
+    if [[ ${nvram_ip} =~ ^[0-9] ]]; then
+        log_msg "WAN IP from router firmware is ${nvram_ip}"
+    else
+        log_msg "Router firmware did not pass a valid WAN IP"
+        nvram_ip=$(nvram get wan0_realip_ip)
+        log_msg "WAN IP from NVRAM is ${nvram_ip}"
     fi
 
+    for tries in {1..5}; do
+        #log_msg "Fetching WAN IP from ipinfo.io/ip"
+        ipinfo_ip=$(curl -s ipinfo.io/ip 2>/dev/null)
+        if [[ ${ipinfo_ip} =~ ^[0-9] ]]; then
+            log_msg "WAN IP from ipinfo.io/ip is ${ipinfo_ip}"
+            break
+    fi
+        log_msg "Failed retrieving WAN IP from ipinfo.ip (try number ${tries})"
+        sleep 1
+    done
+
+    if [[ ${ipinfo_ip} =~ ^[0-9] ]]; then
     if [[ ${nvram_ip} == ${ipinfo_ip} ]]; then
         echo ${nvram_ip}
     else
-        log_msg "NVRAM WAN value (${nvram_ip}) does not match ipinfo.io/ip (${ipinfo_ip:=null})"
+            log_msg "NVRAM WAN IP (${nvram_ip}) does not match ipinfo.io/ip (${ipinfo_ip:=null})"
         # Assume that if we can ping ${ipinfo_ip} that it is correct
         # I have seen the NVRAM value take a min to get the right value
         ping -c1 ${ipinfo_ip} | grep -qs '1 packets received'
         if (( ${?} == 0 )); then
             log_msg "${ipinfo_ip} is alive - overriding NVRAM value"
             echo ${ipinfo_ip}
-	    nvram set wan_ipaddr=${ipinfo_ip}
+            nvram set wan0_realip_ip=${ipinfo_ip}
         else
             log_msg "${ipinfo_ip} is unreachable - retaining NVRAM value"
             echo ${nvram_ip}
         fi
+        fi
+    else
+        log_msg "${ipinfo_ip} is unreachable - retaining NVRAM value"
+        echo ${nvram_ip}
     fi
 
     return 0
@@ -153,7 +172,7 @@ main() {
     # Make sure cron job exists
     check_cron
 
-    # Router firmware will pass us current WAN IP $(nvram get wan_ipaddr)
+    # Router firmware will pass us current WAN IP $(nvram get wan0_realip_ip)
     # Reconcile that with what the internet says our IP is
     local current_ip=$(reconcile_wan_ip ${1})
 
@@ -168,13 +187,13 @@ main() {
     # Update A record if IP has changed
     if [[ ${current_ip} != ${dns_ip} ]]; then
         # IPs do not match, so we need to update DNS
-        log_msg "Change detected! WAN IP is now ${current_ip}"
+        log_msg "WAN IP address has changed"
+        log_msg "WAN IP is now ${current_ip}"
         update_dns_record ${current_ip}
         return ${?}
     else
         # IP change not needed, but we have to report that to the firmware to keep it happy
-        #log_msg "IP address is still ${current_ip}"
-        #log_msg "WAN IP ${current_ip} has not changed"
+        log_msg "WAN IP has not changed"
         notify_firmware 1
         return 0
     fi
